@@ -7,7 +7,7 @@ hooks:
     actions:
       - |-
         NSS_CHK_SIGN_LIBS="${NSS_CHK_SIGN_LIBS:-freebl3 nssdbm3 softokn3}"
-        LIBS=${LIBS:-/usr/lib64}
+        LIBS=${LIBS:-/usr/$(get_libdir)}
         shlibsign=${shlibsign:-shlibsign}
 
         if [ -n "${DEBUG}" ] ; then 
