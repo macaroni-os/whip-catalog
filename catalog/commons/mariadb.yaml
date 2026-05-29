@@ -1,0 +1,417 @@
+hooks:
+
+  setup:
+    remediate: mariadb
+    check: config
+    description: |-
+      Setup MariaDB installation.
+
+      Set MARIADB_USER to override default user mysql.
+
+      Set MARIADB_GROUP to override default group mysql.
+
+    actions:
+      - |-
+        EROOT=${EROOT:-}
+        MARIADB_USER=${MARIADB_USER:-mysql}
+        MARIADB_GROUP=${MARIADB_GROUP:-mysql}
+
+        MY_SHAREDSTATEDIR=${MY_SHAREDSTATEDIR:-/usr/share/mariadb}
+        MY_SYSCONFDIR=${MY_SYSCONFDIR:-/etc/mysql}
+        MY_LOCALSTATEDIR=${MY_LOCALSTATEDIR:-/var/lib/mysql}
+        MY_LOGDIR=${MY_LOGDIR:-/var/log/mysql}
+        MY_DATADIR="${MY_DATADIR:-}"
+        PN="dev-db/mariadb"
+
+        SETUP_TMPDIR="${SETUP_TMPDIR:-/tmp/mariadb}"
+
+        source /etc/profile
+        source /lib/gentoo/functions.sh
+
+        if [ -n "${DEBUG}" ] ; then
+          set -x
+        fi
+
+        die() {
+          if [ $# -gt 0 ] ; then
+            echo $@
+          fi
+          exit 1
+        }
+
+        _mysql_init_vars() {
+          if [[ -z "${MY_DATADIR}" ]] ; then
+            MY_DATADIR=""
+            if [[ -f "${MY_SYSCONFDIR}/my.cnf" ]] ; then
+              MY_DATADIR=$(my_print_defaults mysqld 2>/dev/null \
+                | sed -ne '/datadir/s|^--datadir=||p' \
+                | tail -n1)
+              if [[ -z "${MY_DATADIR}" ]] ; then
+                MY_DATADIR=$(grep ^datadir "${MY_SYSCONFDIR}/my.cnf" \
+                | sed -e 's/.*=\s*//' \
+                | tail -n1)
+              fi
+            fi
+            if [[ -z "${MY_DATADIR}" ]] ; then
+              MY_DATADIR="${MY_LOCALSTATEDIR}"
+              einfo "Using default MY_DATADIR"
+            fi
+            echo "MariaDB MY_DATADIR is ${MY_DATADIR}"
+
+            if [[ -z "${PREVIOUS_DATADIR}" ]] ; then
+              if [[ -e "${MY_DATADIR}" ]] ; then
+                echo "MariaDB datadir found in ${MY_DATADIR}"
+                echo "A new one will not be created."
+                PREVIOUS_DATADIR="yes"
+              else
+                PREVIOUS_DATADIR="no"
+              fi
+              export PREVIOUS_DATADIR
+            fi
+          else
+            local new_MY_DATADIR
+            new_MY_DATADIR=$(my_print_defaults mysqld 2>/dev/null \
+              | sed -ne '/datadir/s|^--datadir=||p' \
+              | tail -n1)
+
+            if [[ ( -n "${new_MY_DATADIR}" ) && ( "${new_MY_DATADIR}" != "${MY_DATADIR}" ) ]]; then
+              ewarn "MariaDB MY_DATADIR has changed"
+              ewarn "from ${MY_DATADIR}"
+              ewarn "to ${new_MY_DATADIR}"
+              MY_DATADIR="${new_MY_DATADIR}"
+            fi
+          fi
+          export MY_DATADIR
+        }
+
+        _getoptval() {
+          local section="${1}"
+          local flag="--${2}="
+          local extra_options="${3}"
+          local cmd=(
+            "my_print_defaults"
+            "${extra_options}"
+            "${section}"
+          )
+          local results=( $(eval "${cmd[@]}" 2>/dev/null | sed -n "/^${flag}/s,${flag},,gp") )
+
+          if [[ ${#results[@]} -gt 0 ]] ; then
+            # When option is set multiple times only return last value
+            echo "${results[-1]}"
+          fi
+        }
+
+        _setup_mariadb() {
+          local bins=(
+            /usr/bin/mysql
+            /usr/sbin/mysqld
+            /usr/bin/mysql_install_db
+            /usr/bin/my_print_defaults
+          )
+          for i in ${bins[@]}; do
+            if [[ ! -x "${EROOT}${i}" ]] ; then
+              die "'${i}' not found! Please install/re-install dev-db/mariadb!"
+            fi
+          done
+          local mysqld_binary=/usr/sbin/mysqld
+          local mysql_install_db_binary=/usr/bin/mysql_install_db
+
+          # my_print_defaults needs to read stuff in $HOME/.my.cnf
+          if [ -z "${HOME}" ] ; then
+            HOME="${EROOT}/root"
+          fi
+
+          _mysql_init_vars
+
+          # MySQL _will_ object strenously if your machine is named
+          # localhost. Also causes weird failures.
+          [[ "${HOSTNAME}" == "localhost" ]] && die "Your machine must NOT be named localhost"
+
+          if [[ -d "${MY_DATADIR}/mysql" ]] ; then
+            ewarn "Looks like your data directory '${MY_DATADIR}' is already initialized!"
+            ewarn "Please rename or delete its content if you wish to initialize a new data directory."
+            die "dev-db/mariadb data directory at '${MY_DATADIR}' looks already initialized!"
+          fi
+
+          MARIADB_TMPDIR="$(_getoptval mysqld tmpdir "--defaults-file='${MY_SYSCONFDIR}/my.cnf'")"
+          MARIADB_TMPDIR=${MARIADB_TMPDIR%/}
+          # These are dir+prefix
+          MARIADB_LOG_BIN="$(_getoptval mysqld log-bin "--defaults-file='${MY_SYSCONFDIR}/my.cnf'")"
+          MARIADB_LOG_BIN=${MARIADB_LOG_BIN%/*}
+          MARIADB_RELAY_LOG="$(_getoptval mysqld relay-log "--defaults-file='${MY_SYSCONFDIR}/my.cnf'")"
+          MARIADB_RELAY_LOG=${MARIADB_RELAY_LOG%/*}
+
+          # Create missing directories.
+          # Always check if mysql user can write to directory even if we just
+          # created directory because a parent directory might be not
+          # accessible for that user.
+          PID_DIR="${EROOT}/run/mysqld"
+          if [[ ! -d "${PID_DIR}" ]] ; then
+            einfo "Creating dev-db/mariadb PID directory '${PID_DIR}' ..."
+            install -d -m 755 -o ${MARIADB_USER} -g ${MARIADB_GROUP} "${PID_DIR}" \
+              || die "Failed to create PID directory '${PID_DIR}'!"
+          fi
+
+          if [[ ! -d "${MY_DATADIR}" ]] ; then
+            einfo "Creating dev-db/mariadb data directory '${MY_DATADIR}' ..."
+            install -d -m 770 -o ${MARIADB_USER} -g ${MARIADB_GROUP} "${MY_DATADIR}" \
+              || die "Failed to create ${PN} data directory '${MY_DATADIR}'!"
+          fi
+
+          if [[ -n "${MARIADB_TMPDIR}" && ! -d "${MARIADB_TMPDIR}" ]] ; then
+            einfo "Creating ${PN} tmpdir '${MARIADB_TMPDIR}' ..."
+            install -d -m 770 -o ${MARIADB_USER} -g ${MARIADB_GROUP} "${MARIADB_TMPDIR}" \
+              || die "Failed to create ${PN} tmpdir '${MARIADB_TMPDIR}'!"
+          fi
+
+          if [[ -n "${MARIADB_LOG_BIN}" && ! -d "${MARIADB_LOG_BIN}" ]] ; then
+            einfo "Creating ${PN} log-bin directory '${MARIADB_LOG_BIN}' ..."
+            install -d -m 770 -o ${MARIADB_USER} -g ${MARIADB_GROUP} "${MARIADB_LOG_BIN}" \
+              || die "Failed to create ${PN} log-bin directory '${MARIADB_LOG_BIN}'"
+          fi
+
+          if [[ -n "${MARIADB_RELAY_LOG}" && ! -d "${MARIADB_RELAY_LOG}" ]] ; then
+            einfo "Creating ${PN} relay-log directory '${MARIADB_RELAY_LOG}' ..."
+            install -d -m 770 -o ${MARIADB_USER} -g ${MARIADB_GROUP} "${MARIADB_RELAY_LOG}" \
+              || die "Failed to create ${PN} relay-log directory '${MARIADB_RELAY_LOG}'!"
+          fi
+
+          eval "mkdir -p ${SETUP_TMPDIR} || true"
+          # Limit access
+          chmod 0770 "${SETUP_TMPDIR}" || die
+          chown ${MARIADB_USER} "${SETUP_TMPDIR}" || die
+
+          local mysql_install_log="${SETUP_TMPDIR}/install_db.log"
+          local mysqld_logfile="${SETUP_TMPDIR}/mysqld.log"
+
+          echo ""
+          einfo "Detected settings:"
+          einfo "=================="
+          einfo "MariaDB User:\t\t\t\t${MARIADB_USER}"
+          einfo "MariaDB Group:\t\t\t\t${MARIADB_GROUP}"
+          einfo "MariaDB DATA directory:\t\t${MY_DATADIR}"
+          einfo "MariaDB TMP directory:\t\t\t${MARIADB_TMPDIR}"
+
+          if [[ -n "${MARIADB_LOG_BIN}" ]] ; then
+            einfo "MariaDB Binary Log File location:\t${MARIADB_LOG_BIN}"
+          fi
+
+          if [[ -n "${MARIADB_RELAY_LOG}" ]] ; then
+            einfo "MariaDB Relay Log File location:\t${MARIADB_RELAY_LOG}"
+          fi
+
+          einfo "PID DIR:\t\t\t\t${PID_DIR}"
+          einfo "Install db log:\t\t\t${mysql_install_log}"
+          einfo "Install server log:\t\t\t${mysqld_logfile}"
+
+          echo
+
+          if [[ -z "${MARIADB_ROOT_PASSWORD}" ]] ; then
+            local tmp_mysqld_password_source=
+
+            for tmp_mysqld_password_source in mysql client ; do
+              einfo "Trying to get password for mysql 'root' user from '${tmp_mysqld_password_source}' section ..."
+              MARIADB_ROOT_PASSWORD="$(_getoptval "${tmp_mysqld_password_source}" password)"
+              if [[ -n "${MARIADB_ROOT_PASSWORD}" ]] ; then
+                if [[ ${MARIADB_ROOT_PASSWORD} == *$'\n'* ]] ; then
+                  ewarn "Ignoring password from '${tmp_mysqld_password_source}' section due to newline character (do you have multiple password options set?)!"
+                  MARIADB_ROOT_PASSWORD=
+                  continue
+                fi
+
+                einfo "Found password in '${tmp_mysqld_password_source}' section!"
+                break
+              fi
+            done
+
+            # Sometimes --show is required to display passwords in some implementations of my_print_defaults
+            if [[ "${MARIADB_ROOT_PASSWORD}" == '*****' ]] ; then
+              MARIADB_ROOT_PASSWORD="$(_getoptval "${tmp_mysqld_password_source}" password --show)"
+            fi
+
+            unset tmp_mysqld_password_source
+          fi
+
+          if [[ -z "${MARIADB_ROOT_PASSWORD}" ]] ; then
+            local pwd1="a"
+            local pwd2="b"
+
+            echo
+            einfo "No password for mysql 'root' user was specified via environment"
+            einfo "variable MARIADB_ROOT_PASSWORD and no password was found in config"
+            einfo "file like '${HOME}/.my.cnf'."
+            einfo "To continue please provide a password for the mysql 'root' user"
+            einfo "now on console:"
+            ewarn 'NOTE: Please avoid double quotes, single quotes, backslash, underscore and percent characters in the password!'
+            read -rsp "    >" pwd1 ; echo
+
+            einfo "Retype the password"
+            read -rsp "    >" pwd2 ; echo
+
+            if [[ "x${pwd1}" != "x${pwd2}" ]] ; then
+              die "Passwords are not the same!"
+            fi
+
+            MARIADB_ROOT_PASSWORD="${pwd1}"
+            unset pwd1 pwd2
+
+            echo
+          fi
+
+          local -a mysqld_options
+
+          # Figure out which options we need to disable to do the setup
+          local helpfile="${TMPDIR}/mysqld-help"
+          "${EROOT}/usr/sbin/mysqld" --verbose --help >"${helpfile}" 2>/dev/null
+
+          local opt optexp optfull
+          for opt in host-cache name-resolve networking slave-start \
+            federated ssl log-bin relay-log slow-query-log external-locking \
+            log-slave-updates \
+          ; do
+            optexp="--(skip-)?${opt}" optfull="--loose-skip-${opt}"
+            grep -E -sq -- "${optexp}" "${helpfile}" && mysqld_options+=( "${optfull}" )
+          done
+
+          # Prepare timezones, see
+          # https://dev.mysql.com/doc/mysql/en/time-zone-support.html
+          local tz_sql="${SETUP_TMPDIR}/tz.sql"
+
+          echo "USE mysql;" >"${tz_sql}"
+          "${EROOT}/usr/bin/mysql_tzinfo_to_sql" "${EROOT}/usr/share/zoneinfo" >> "${tz_sql}" 2>/dev/null
+          if [[ $? -ne 0 ]] ; then
+            die "mysql_tzinfo_to_sql failed!"
+          fi
+
+          local cmd=(
+            "${mysql_install_db_binary}"
+            "${mysqld_options[@]}"
+            "--init-file='${tz_sql}'"
+            "--basedir='${EROOT}/usr'"
+            "--datadir='${MY_DATADIR}'"
+            "--tmpdir='${MARIADB_TMPDIR}'"
+            "--log-error='${mysql_install_log}'"
+            "--rpm"
+            "--cross-bootstrap"
+            "--skip-test-db"
+            "--user=${MARIADB_USER}"
+          )
+
+          einfo "Initializing ${PN} data directory: ${cmd[@]}"
+          eval "${cmd[@]}" >>"${mysql_install_log}" 2>&1
+
+          if [[ $? -ne 0 || ! -f "${MY_DATADIR}/mysql/user.frm" ]] ; then
+            grep -B5 -A999 -iE "(Aborting|ERROR|errno)" "${mysql_install_log}" 1>&2
+            die "Failed to initialize ${PN} data directory. Please review '${mysql_install_log}'!"
+          fi
+
+          local x=${RANDOM}
+          local socket="${PID_DIR}/mysqld.${x}.sock"
+          [[ -f "${socket}" ]] && die "Randomness failed; Socket ${socket} already exists!"
+          local pidfile="${PID_DIR}/mysqld.${x}.pid"
+          [[ -f "${pidfile}" ]] && die "Randomness failed; Pidfile ${pidfile} already exists!"
+          unset x
+
+          cmd=(
+            "${mysqld_binary}"
+            "${mysqld_options[@]}"
+            "--basedir='${EROOT}/usr'"
+            "--datadir='${MY_DATADIR}'"
+            "--tmpdir='${MARIADB_TMPDIR}'"
+            --max_allowed_packet=8M
+            --net_buffer_length=16K
+            "--socket='${socket}'"
+            "--pid-file='${pidfile}'"
+            "--log-error='${mysqld_logfile}'"
+            "--user=${MARIADB_USER}"
+          )
+
+          einfo "Starting mysqld to finalize initialization: ${cmd[@]}"
+          eval "${cmd[@]}" >>"${mysqld_logfile}" 2>&1 &
+
+          echo -n "Waiting for mysqld to accept connections "
+          local maxtry=15
+          while [[ ! -S "${socket}" && "${maxtry}" -gt 1 ]] ; do
+            maxtry=$((${maxtry}-1))
+            echo -n "."
+            sleep 1
+          done
+
+          if [[ -S "${socket}" ]] ; then
+            # Even with a socket we don't know if mysqld will abort
+            # start due to an error so just wait a little bit more...
+            maxtry=5
+            while [[ -S "${socket}" && "${maxtry}" -gt 1 ]] ; do
+              maxtry=$((${maxtry}-1))
+              echo -n "."
+              sleep 1
+            done
+          fi
+
+          echo
+
+          if [[ ! -S "${socket}" ]] ; then
+            grep -B5 -A999 -iE "(Aborting|ERROR|errno)" "${mysqld_logfile}" 1>&2
+            die "mysqld was unable to start from initialized data directory. Please review '${mysqld_logfile}'!"
+          fi
+
+          local mysql_logfile="${SETUP_TMPDIR}/set_root_pw.log"
+          touch "${mysql_logfile}" || die
+
+          ebegin "Setting root password"
+          # Do this from memory, as we don't want clear text passwords in temp files
+          local sql="ALTER USER 'root'@'localhost' IDENTIFIED BY '${MARIADB_ROOT_PASSWORD}'"
+          cmd=(
+            /usr/bin/mysql
+            --no-defaults
+            "--socket='${socket}'"
+            -hlocalhost
+            "-e \"${sql}\""
+          )
+          eval "${cmd[@]}" >"${mysql_logfile}" 2>&1
+          local rc=$?
+          eend ${rc}
+
+          if [[ ${rc} -ne 0 ]] ; then
+            # Poor man's solution which tries to avoid having password
+            # in log.  NOTE: sed can fail if user didn't follow advice
+            # and included character which will require escaping...
+            sed -i -e "s/${MARIADB_ROOT_PASSWORD}/*****/" "${mysql_logfile}" 2>/dev/null
+
+            grep -B5 -A999 -iE "(Aborting|ERROR|errno)" "${mysql_logfile}"
+            die "Failed to set ${PN} root password. Please review '${mysql_logfile}'!"
+          fi
+
+          # Stop the server
+          if [[ -f "${pidfile}" ]] && pgrep -F "${pidfile}" &>/dev/null ; then
+            echo -n "Stopping the server "
+            pkill -F "${pidfile}" &>/dev/null
+
+            maxtry=10
+            while [[ -f "${pidfile}" ]] && pgrep -F "${pidfile}" &>/dev/null ; do
+              maxtry=$((${maxtry}-1))
+              echo -n "."
+              sleep 1
+            done
+
+            echo
+
+            if [[ -f "${pidfile}" ]] && pgrep -F "${pidfile}" &>/dev/null ; then
+              # We somehow failed to stop server.
+              # However, not a fatal error. Just warn the user.
+              ewarn "WARNING: mysqld[$(cat "${pidfile}")] is still running!"
+            fi
+          fi
+
+          rm -r "${SETUP_TMPDIR}" || die
+
+          einfo "${PN} data directory at '${MY_DATADIR}' successfully initialized!"
+        }
+
+        _setup_mariadb
+
+
+
+entrypoint:
+  - /bin/bash
+  - -c
