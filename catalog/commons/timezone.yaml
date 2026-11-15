@@ -1,0 +1,39 @@
+hooks:
+  timezone_setup:
+    remediate: timezone_setup
+    check: timezone
+    description: |
+      Set /etc/localtime from the TIMEZONE declared in /etc/timezone
+    actions:
+      - |-
+        EROOT=${EROOT:-/}
+
+        tzfile="${EROOT}"etc/timezone
+        localtime="${EROOT}"etc/localtime
+        zoneinfo="${EROOT}"usr/share/zoneinfo
+
+        # If /etc/localtime is a symlink the user manages it themselves.
+        if [ -L "${localtime}" ] ; then
+          exit 0
+        fi
+
+        # Nothing to do without a declared timezone.
+        if [ ! -e "${tzfile}" ] ; then
+          exit 0
+        fi
+
+        tz=$(grep -vE '^[[:space:]]*#' "${tzfile}" | head -1 | tr -d '[:space:]')
+        if [ -z "${tz}" ] ; then
+          exit 0
+        fi
+
+        if [ ! -e "${zoneinfo}/${tz}" ] ; then
+          echo "Invalid TIMEZONE '${tz}' in ${tzfile}" >&2
+          exit 1
+        fi
+
+        cp -f "${zoneinfo}/${tz}" "${localtime}"
+
+entrypoint:
+  - /bin/bash
+  - -c
